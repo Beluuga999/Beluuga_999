@@ -2,15 +2,25 @@ package chainio
 
 import (
 	"context"
+	"fmt"
 	"github.com/Layr-Labs/eigensdk-go/chainio/clients"
 	"github.com/Layr-Labs/eigensdk-go/chainio/clients/avsregistry"
 	"github.com/Layr-Labs/eigensdk-go/chainio/clients/eth"
 	"github.com/Layr-Labs/eigensdk-go/logging"
 	"github.com/Layr-Labs/eigensdk-go/signer"
+	gethcommon "github.com/ethereum/go-ethereum/common"
 	gethtypes "github.com/ethereum/go-ethereum/core/types"
 	servicemanager "github.com/yetanotherco/aligned_layer/contracts/bindings/AlignedLayerServiceManager"
 	"github.com/yetanotherco/aligned_layer/core/config"
 	"github.com/yetanotherco/aligned_layer/core/utils"
+	"math/big"
+	"time"
+)
+
+const (
+	LowFeeMaxRetries          = 25
+	LowFeeSleepTime           = 20 * time.Second
+	LowFeeIncrementPercentage = 25
 )
 
 type AvsWriter struct {
@@ -77,7 +87,7 @@ func (w *AvsWriter) SendTask(context context.Context, batchMerkleRoot [32]byte, 
 		return err
 	}
 
-	_, err = utils.WaitForTransactionReceipt(w.Client, context, tx.Hash())
+	_, err = utils.WaitForTransactionReceipt(w.Client, context, tx.Hash(), 25, 5*time.Second)
 	if err != nil {
 		return err
 	}
@@ -96,17 +106,73 @@ func (w *AvsWriter) SendAggregatedResponse(ctx context.Context, batchMerkleRoot 
 	// Send the transaction
 	txOpts.NoSend = false
 	txOpts.GasLimit = tx.Gas() * 110 / 100 // Add 10% to the gas limit
+	uin64TxNonce, err := w.Client.PendingNonceAt(ctx, txOpts.From)
+	if err != nil {
+		return nil, err
+	}
 	tx, err = w.AvsContractBindings.ServiceManager.RespondToTask(&txOpts, batchMerkleRoot, nonSignerStakesAndSignature)
 	if err != nil {
 		return nil, err
 	}
 
-	receipt, err := utils.WaitForTransactionReceipt(w.Client, ctx, tx.Hash())
+	txNonce := new(big.Int).SetUint64(uin64TxNonce)
+
+	w.logger.Info("Tx nonce before waiting for receipt", "nonce", txNonce)
+
+	receipt, err := w.WaitForTransactionReceiptWithIncreasingTip(ctx, tx.Hash(), txNonce, batchMerkleRoot, nonSignerStakesAndSignature)
+	w.logger.Info("Transaction receipt:", "receipt", receipt)
 	if err != nil {
 		return nil, err
 	}
 
 	return receipt, nil
+}
+
+func (w *AvsWriter) WaitForTransactionReceiptWithIncreasingTip(ctx context.Context, txHash gethcommon.Hash, txNonce *big.Int, batchMerkleRoot [32]byte, nonSignerStakesAndSignature servicemanager.IBLSSignatureCheckerNonSignerStakesAndSignature) (*gethtypes.Receipt, error) {
+	for i := 0; i < LowFeeMaxRetries; i++ {
+		time.Sleep(LowFeeSleepTime)
+		// Attempt to get the transaction receipt
+		receipt, err := w.Client.TransactionReceipt(ctx, txHash)
+		if err == nil && receipt != nil {
+			return receipt, nil
+		}
+
+		// Simulate the transaction to get the gas limit and gas tip cap again
+		txOpts := *w.Signer.GetTxOpts()
+		txOpts.NoSend = true
+		tx, err := w.AvsContractBindings.ServiceManager.RespondToTask(&txOpts, batchMerkleRoot, nonSignerStakesAndSignature)
+		if err != nil {
+			return nil, err
+		}
+		w.logger.Info("Simulated tx nonce", "nonce", tx.Nonce())
+
+		// Use the same nonce as the original transaction
+		txOpts.Nonce = txNonce
+
+		// Use the gas limit of the simulated transaction
+		txOpts.GasLimit = tx.Gas()
+
+		w.logger.Info("Bumping gas price for tx", "txHash", txHash.String())
+
+		// Increase the gas price by IncrementPercentage
+		newGasPrice := new(big.Int).Mul(big.NewInt(int64(LowFeeIncrementPercentage+100)), tx.GasPrice())
+		newGasPrice.Div(newGasPrice, big.NewInt(100))
+		txOpts.GasPrice = newGasPrice
+
+		// Submit the transaction with the new gas price cap
+		txOpts.NoSend = false
+		tx, err = w.AvsContractBindings.ServiceManager.RespondToTask(&txOpts, batchMerkleRoot, nonSignerStakesAndSignature)
+		if err != nil {
+			return nil, err
+		}
+		w.logger.Info("New tx nonce after bumping gas price", "nonce", tx.Nonce())
+		w.logger.Info("New tx hash after bumping gas price", "txHash", tx.Hash().String())
+
+		// Update the transaction hash for the next retry
+		txHash = tx.Hash()
+	}
+
+	return nil, fmt.Errorf("transaction receipt not found for txHash: %s", txHash.String())
 }
 
 // func (w *AvsWriter) RaiseChallenge(
